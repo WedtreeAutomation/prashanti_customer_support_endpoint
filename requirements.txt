@@ -1,0 +1,12 @@
+flask 
+requests 
+groq 
+firebase-admin 
+python-dotenv 
+tenacity
+openai 
+google-cloud-firestore 
+google-cloud-storage 
+google-auth 
+google-api-python-client 
+gunicorn
