@@ -17,6 +17,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import re
 import hashlib
 from collections import OrderedDict, defaultdict
+from google.cloud.firestore import FieldFilter
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -141,7 +142,8 @@ def is_call_processed(call_id):
     if db:
         try:
             calls_ref = db.collection('call_analysis')
-            query = calls_ref.where('callId', '==', call_id).limit(1)
+            # FIX: Use keyword argument instead of positional argument
+            query = calls_ref.where(filter=firestore.FieldFilter('callId', '==', call_id)).limit(1)
             docs = query.stream()
             if any(True for _ in docs):
                 # Add to cache to avoid future Firestore queries
@@ -461,9 +463,9 @@ def get_agent_by_dialed_number(dialed_number):
         # Clean phone number (remove any non-digit characters)
         clean_phone = ''.join(filter(str.isdigit, dialed_number))
         
-        # Query agents collection
+        # Query agents collection with proper filter syntax
         agents_ref = db.collection('agents')
-        query = agents_ref.where('phone', '==', clean_phone).limit(1)
+        query = agents_ref.where(filter=firestore.FieldFilter('phone', '==', clean_phone)).limit(1)
         docs = query.stream()
         
         for doc in docs:
@@ -861,7 +863,7 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
         update_call_volume_stats(call_doc, "answered")
         
         # Update call type statistics
-        update_call_type_stats(call_type_data.get('primary_category', 'Unknown'))
+        # update_call_type_stats(call_type_data.get('primary_category', 'Unknown'))
         
         logger.info(f"Call analysis stored for agent {agent_data['name']} as {call_doc_name} - Type: {call_type_data.get('primary_category', 'Unknown')}")
         return call_doc_name
@@ -1176,14 +1178,26 @@ def webhook():
             if request.form:
                 data.update(request.form.to_dict())
             if request.is_json:
-                data.update(request.get_json() or {})
+                try:
+                    data.update(request.get_json() or {})
+                except Exception as json_error:
+                    logger.warning(f"Failed to parse JSON data: {json_error}")
 
         # Decode URL-encoded values
         data = decode_url_encoded_values(data)
 
+        # Log received data (without sensitive information)
+        log_data = {k: v for k, v in data.items() if 'password' not in k.lower() and 'token' not in k.lower()}
+        logger.info(f"Webhook received: {log_data}")
+
         # Check for answered call
         if data.get("dialstatus", "").upper() == "ANSWER":
             logger.info(f"Processing answered call from {data.get('caller', 'unknown')}")
+            
+            # Validate required fields
+            if not data.get('recording'):
+                logger.warning("No recording URL provided for answered call")
+                return jsonify({"status": "skipped", "message": "No recording URL"}), 200
             
             # Process the call recording
             result, error = process_call_recording(data.get('recording', ''), data)
@@ -1214,13 +1228,14 @@ def webhook():
             }
             update_call_volume_stats(call_data, "unanswered")
             
-            # Skip non-answered calls
-            return jsonify({"status": "skipped", "message": "Not an ANSWERed call"}), 200
+            dial_status = data.get("dialstatus", "unknown")
+            logger.info(f"Skipping non-answered call with status: {dial_status}")
+            return jsonify({"status": "skipped", "message": f"Not an ANSWERed call (status: {dial_status})"}), 200
 
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
-
+        
 @app.route("/health", methods=["GET"])
 def health_check():
     """Simple health check endpoint."""
