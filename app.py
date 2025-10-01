@@ -219,7 +219,7 @@ def detect_language(transcription):
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def analyze_call_with_azure_openai(transcript_text, language):
-    """Generate comprehensive call analysis using Azure OpenAI GPT-4 with optimized sentiment detection"""
+    """Generate comprehensive call analysis using Azure OpenAI GPT-4 with optimized sentiment detection and call type classification"""
     if not azure_openai_client:
         return None, "Azure OpenAI client not initialized"
     
@@ -227,10 +227,73 @@ def analyze_call_with_azure_openai(transcript_text, language):
         analysis_prompt = f"""
         You are a call analysis system for a saree company named Prashanti. Your task is to evaluate the customer's sentiment and the call's overall outcome from a customer service perspective. This is a call transcript in {language}.
         
+        **CALL TYPE CLASSIFICATION CATEGORIES:**
+        
+        1. **Product-related Queries**
+           - Questions about saree collections, fabrics, designs, colors
+           - Size and measurement inquiries
+           - Product availability and stock checks
+           - Pricing and discount questions
+           - Customization requests
+        
+        2. **Service Queries**
+           - Store locations and timings
+           - Tailoring services
+           - Styling advice and recommendations
+           - Exchange policies
+           - Delivery options
+        
+        3. **Loyalty & Membership Queries**
+           - Loyalty program benefits
+           - Membership registration
+           - Points and rewards inquiries
+           - Special member discounts
+           - Membership tier questions
+        
+        4. **Technical Queries (Online Platforms)**
+           - Website/Shopify login issues
+           - Online ordering problems
+           - Payment gateway errors
+           - Account management
+           - Digital catalog access
+        
+        5. **Complaint & Feedback Queries**
+           - Product quality complaints
+           - Delivery delays
+           - Wrong items received
+           - Customer service feedback
+           - Return requests
+        
+        6. **Order Management**
+           - Order status tracking
+           - Order modification requests
+           - Cancellation requests
+           - Bulk order inquiries
+           - Shipping updates
+        
+        7. **Sales & Promotion Inquiries**
+           - Current offers and promotions
+           - Festival discounts
+           - Seasonal sales
+           - Corporate bulk discounts
+           - Wedding collection offers
+        
+        **CLASSIFICATION RULES:**
+        - Choose the PRIMARY category that best represents the main purpose of the call
+        - If multiple categories apply, select the most dominant one
+        - For complaint-related calls, use "Complaint & Feedback Queries" even if it involves products or services
+        - For technical website issues, use "Technical Queries" regardless of context
+        
         Provide ONLY a valid JSON object with the following exact structure:
         
         {{
             "summary": "2-line summary of the call",
+            "call_type": {{
+                "primary_category": "exact_category_name_from_above_list",
+                "sub_category": "specific_sub_topic_based_on_call_content",
+                "confidence_score": 0.95,
+                "secondary_categories": ["list_of_other_relevant_categories"]
+            }},
             "objections": ["list of top 3 customer objections with context"],
             "competitors": ["list of competitors mentioned with context about what was said"],
             "scores": {{
@@ -299,9 +362,9 @@ def analyze_call_with_azure_openai(transcript_text, language):
         response = azure_openai_client.chat.completions.create(
             model=AZURE_DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": analysis_prompt}],
-            temperature=0.3,  # Slightly higher temperature for more nuanced analysis
-            max_tokens=1200,  # Increased for comprehensive analysis
-            top_p=0.95,  # More diverse outputs
+            temperature=0.3,
+            max_tokens=1500,  # Increased for comprehensive analysis including call type
+            top_p=0.95,
             response_format={"type": "json_object"}
         )
         
@@ -314,6 +377,29 @@ def analyze_call_with_azure_openai(transcript_text, language):
         # Parse JSON response with better error handling
         try:
             analysis = json.loads(response_text)
+            
+            # Validate call_type structure
+            call_type = analysis.get('call_type', {})
+            if not isinstance(call_type, dict):
+                analysis['call_type'] = {
+                    'primary_category': 'Unknown',
+                    'sub_category': 'Unknown',
+                    'confidence_score': 0.0,
+                    'secondary_categories': []
+                }
+            else:
+                # Ensure required call_type fields exist
+                required_fields = ['primary_category', 'sub_category', 'confidence_score', 'secondary_categories']
+                for field in required_fields:
+                    if field not in call_type:
+                        if field == 'primary_category':
+                            call_type[field] = 'Unknown'
+                        elif field == 'sub_category':
+                            call_type[field] = 'Unknown'
+                        elif field == 'confidence_score':
+                            call_type[field] = 0.0
+                        elif field == 'secondary_categories':
+                            call_type[field] = []
             
             # Validate talk_ratio format
             talk_ratio = analysis.get('talk_ratio', '')
@@ -334,8 +420,9 @@ def analyze_call_with_azure_openai(transcript_text, language):
             else:
                 analysis['sentiment'] = sentiment
             
-            # Log sentiment for monitoring
-            logger.info(f"Sentiment analysis result: {sentiment}")
+            # Log call type and sentiment for monitoring
+            primary_category = analysis.get('call_type', {}).get('primary_category', 'Unknown')
+            logger.info(f"Call type classification: {primary_category}, Sentiment: {sentiment}")
             
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing failed. Response was: {response_text}")
@@ -682,7 +769,7 @@ def get_call_volume_stats():
         return None
 
 def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
-    """Store call analysis in Firestore with Firebase Storage URL"""
+    """Store call analysis in Firestore with Firebase Storage URL including call type classification"""
     if not db:
         logger.warning("Firestore not available - skipping storage")
         return None
@@ -694,6 +781,14 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
         
         # Calculate overall score
         overall_score = calculate_call_score(analysis)
+        
+        # Extract call type information
+        call_type_data = analysis.get('call_type', {
+            'primary_category': 'Unknown',
+            'sub_category': 'Unknown',
+            'confidence_score': 0.0,
+            'secondary_categories': []
+        })
         
         # Extract call sections from the analysis
         call_sections = analysis.get('call_sections', {
@@ -707,7 +802,7 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
         # Extract talk ratio (customer:agent format)
         talk_ratio = analysis.get('talk_ratio', '50:50')
         
-        # Prepare call document with enhanced data
+        # Prepare call document with enhanced data including call type
         call_doc = {
             'callId': call_data.get('id', ''),
             'agentId': agent_data['id'],
@@ -720,6 +815,15 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
             'duration': int(call_data.get('duration', 0)),
             'recordingUrl': storage_url,  # Firebase Storage URL
             'summary': analysis.get('summary', ''),
+            
+            # Call type classification
+            'callType': {
+                'primary': call_type_data.get('primary_category', 'Unknown'),
+                'subCategory': call_type_data.get('sub_category', 'Unknown'),
+                'confidence': call_type_data.get('confidence_score', 0.0),
+                'secondary': call_type_data.get('secondary_categories', [])
+            },
+            
             'objections': analysis.get('objections', []),
             'competitors': analysis.get('competitors', []),
             'scores': analysis.get('scores', {}),
@@ -756,7 +860,10 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
         # Update call volume statistics for answered call
         update_call_volume_stats(call_doc, "answered")
         
-        logger.info(f"Call analysis stored for agent {agent_data['name']} as {call_doc_name}")
+        # Update call type statistics
+        update_call_type_stats(call_type_data.get('primary_category', 'Unknown'))
+        
+        logger.info(f"Call analysis stored for agent {agent_data['name']} as {call_doc_name} - Type: {call_type_data.get('primary_category', 'Unknown')}")
         return call_doc_name
         
     except Exception as e:
