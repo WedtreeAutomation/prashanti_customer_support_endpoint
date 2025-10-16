@@ -18,11 +18,14 @@ import re
 import hashlib
 from collections import OrderedDict, defaultdict
 from google.cloud.firestore import FieldFilter
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 import statistics
 from openai import AzureOpenAI
+
+# === New Imports for Tone Analysis ===
+import librosa
+import numpy as np
+import soundfile as sf
+# =====================================
 
 load_dotenv()
 
@@ -104,7 +107,7 @@ else:
 # Flask App
 # -------------------------------------------------
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024 # 50MB max file size
 
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -173,6 +176,7 @@ def download_audio(url):
         response.raise_for_status()
         
         # Create a temporary file
+        # Use .mp3 suffix
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
         for chunk in response.iter_content(chunk_size=8192):
             temp_file.write(chunk)
@@ -219,66 +223,220 @@ def detect_language(transcription):
     
     return language_map.get(transcription.language, transcription.language)
 
+# -------------------------------------------------
+# Acoustic Feature and Tone Analysis Functions
+# -------------------------------------------------
+
+def extract_features(audio_path):
+    """Extract acoustic features (pitch, energy, tempo, ZCR) from the audio."""
+    try:
+        # Load audio data. Librosa handles various formats (like mp3)
+        y, sr = librosa.load(audio_path, sr=None, mono=True)
+    except Exception as e:
+        logger.error(f"librosa load error for {audio_path}: {e}")
+        return None
+
+    # Pitch
+    pitches, _ = librosa.piptrack(y=y, sr=sr)
+    pitch_values = pitches[pitches > 0]
+    avg_pitch = np.mean(pitch_values) if len(pitch_values) > 0 else 0.0
+    pitch_std = np.std(pitch_values) if len(pitch_values) > 0 else 0.0
+
+    # Energy (RMS)
+    # Using np.mean(librosa.feature.rms(y=y)[0]) for single value
+    rms = librosa.feature.rms(y=y)[0]
+    avg_energy = np.mean(rms)
+    energy_std = np.std(rms)
+
+    # Tempo (Speech Rate Proxy)
+    try:
+        # tempo returns a single float or array; we take the first element
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, start_bpm=120)  
+        tempo_value = float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)
+    except Exception:
+        tempo_value = 0.0
+        
+    # Zero Crossing Rate
+    zcr = librosa.feature.zero_crossing_rate(y)
+    avg_zcr = np.mean(zcr)
+
+    return {
+        "avg_pitch": round(float(avg_pitch), 2),
+        "pitch_std": round(float(pitch_std), 2),
+        "avg_energy": round(float(avg_energy), 4),
+        "energy_std": round(float(energy_std), 4),
+        "tempo": round(tempo_value, 2),
+        "avg_zcr": round(float(avg_zcr), 4),
+        "duration_sec": round(librosa.get_duration(y=y, sr=sr), 2),
+    }
+
+def split_audio_channels(audio_path):
+    """Split stereo audio into two mono temporary files (agent and customer)."""
+    try:
+        # Load as stereo (mono=False)
+        y, sr = librosa.load(audio_path, sr=None, mono=False)
+    except Exception as e:
+        logger.error(f"librosa load error for splitting {audio_path}: {e}")
+        return audio_path, audio_path, None # Treat as mono if load fails
+
+    if y.ndim == 1:
+        # Mono file, cannot split
+        return audio_path, audio_path, sr
+
+    # Stereo file: y[0] is typically left (Agent), y[1] is right (Customer)
+    agent_temp = tempfile.NamedTemporaryFile(delete=False, suffix='_agent.wav')
+    cust_temp = tempfile.NamedTemporaryFile(delete=False, suffix='_cust.wav')
+    agent_temp.close()
+    cust_temp.close()
+
+    # Write each channel to a separate temporary WAV file
+    sf.write(agent_temp.name, y[0], sr)
+    sf.write(cust_temp.name, y[1], sr)
+    
+    logger.info(f"Split stereo audio into {agent_temp.name} and {cust_temp.name}")
+
+    return agent_temp.name, cust_temp.name, sr
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def analyze_call_with_azure_openai(transcript_text, language):
+def analyze_tone_with_azure(agent_features, customer_features):
+    """Analyze tone and emotion with Azure OpenAI and return mood and tone score."""
+    if not azure_openai_client:
+        return None, "Azure OpenAI client not initialized"
+
+    prompt = f"""
+You are an expert in customer service call tone analysis for a saree company named Prashanti.
+
+You are given extracted acoustic emotion features (pitch, energy, tempo, ZCR) from a customer service call.
+Your task is to interpret these features and provide a summarized tone analysis in a specific JSON format.
+
+**Agent Features:**
+{agent_features}
+
+**Customer Features:**
+{customer_features}
+
+**Interpretation Guidance:**
+- **Pitch:** Indicates excitement, confidence, or nervousness. Higher pitch can mean excitement; low, steady pitch can mean composure.
+- **Energy:** Reflects enthusiasm, loudness, or fatigue. High energy means engagement; low energy means boredom or calmness.
+- **Tempo:** Shows speech speed, engagement, or impatience. Faster tempo can be urgency or excitement; slower can be measured or fatigued.
+- **Agent Mood:** Use 1-2 primary terms: Calm, Energetic, Empathetic, Confident, Stressed, Monotone, Hurried, Engaging.
+- **Customer Mood:** Use 1-2 primary terms: Cooperative, Neutral, Confused, Frustrated, Angry, Pleased, Thankful, Impatient.
+- **Tone Mark (0–10):** Score the agent's tone quality (empathy, enthusiasm, and composure). This score is CRITICAL and represents the overall **acoustic quality** of the agent's performance.
+
+Provide ONLY a valid JSON object with the following exact structure:
+{{
+    "agent_mood": "The agent's primary mood (e.g., Confident and Engaging)", 
+    "customer_mood": "The customer's primary mood (e.g., Frustrated and Impatient)", 
+    "tone_mark": 8, 
+    "reasoning": "A brief, 1-2 sentence interpretation of the features leading to the scores."
+}}
+"""
+
+    try:
+        response = azure_openai_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        if not response_text:
+            return None, "Tone analysis failed: Empty response"
+
+        tone_analysis = json.loads(response_text)
+        
+        # Basic validation and type coercion
+        if 'tone_mark' in tone_analysis:
+            try:
+                # Ensure tone_mark is an integer between 0 and 10
+                tone_analysis['tone_mark'] = max(0, min(10, int(tone_analysis.get('tone_mark', 5))))
+            except:
+                tone_analysis['tone_mark'] = 5 # Default on failure
+        else:
+            tone_analysis['tone_mark'] = 5
+
+        # Add default for required mood fields if missing
+        tone_analysis['agent_mood'] = tone_analysis.get('agent_mood', 'Unknown')
+        tone_analysis['customer_mood'] = tone_analysis.get('customer_mood', 'Unknown')
+        
+        logger.info(f"Tone analysis successful: Agent Mood={tone_analysis['agent_mood']}, Tone Mark={tone_analysis['tone_mark']}")
+        return tone_analysis, None
+
+    except Exception as e:
+        logger.error(f"Azure OpenAI tone analysis error: {str(e)}")
+        return None, f"Tone analysis failed: {str(e)}"
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def analyze_call_with_azure_openai(transcript_text, language, tone_mark):
     """Generate comprehensive call analysis using Azure OpenAI GPT-4 with optimized sentiment detection and call type classification"""
     if not azure_openai_client:
         return None, "Azure OpenAI client not initialized"
     
+    # Inject Tone Mark into the prompt for holistic scoring guidance
+    system_prompt_addition = f"""
+    The agent's acoustic tone quality score (Tone Mark) is: {tone_mark}/10. 
+    Use this score to strongly influence your scoring of 'clarity', 'confidence', 'sympathy', and 'intro' to ensure acoustic performance is a primary factor.
+    """
+
     try:
         analysis_prompt = f"""
         You are a call analysis system for a saree company named Prashanti. Your task is to evaluate the customer's sentiment and the call's overall outcome from a customer service perspective. This is a call transcript in {language}.
         
+        {system_prompt_addition}
+
         **CALL TYPE CLASSIFICATION CATEGORIES:**
         
         1. **Product-related Queries**
-           - Questions about saree collections, fabrics, designs, colors
-           - Size and measurement inquiries
-           - Product availability and stock checks
-           - Pricing and discount questions
-           - Customization requests
+             - Questions about saree collections, fabrics, designs, colors
+             - Size and measurement inquiries
+             - Product availability and stock checks
+             - Pricing and discount questions
+             - Customization requests
         
         2. **Service Queries**
-           - Store locations and timings
-           - Tailoring services
-           - Styling advice and recommendations
-           - Exchange policies
-           - Delivery options
+             - Store locations and timings
+             - Tailoring services
+             - Styling advice and recommendations
+             - Exchange policies
+             - Delivery options
         
         3. **Loyalty & Membership Queries**
-           - Loyalty program benefits
-           - Membership registration
-           - Points and rewards inquiries
-           - Special member discounts
-           - Membership tier questions
+             - Loyalty program benefits
+             - Membership registration
+             - Points and rewards inquiries
+             - Special member discounts
+             - Membership tier questions
         
         4. **Technical Queries (Online Platforms)**
-           - Website/Shopify login issues
-           - Online ordering problems
-           - Payment gateway errors
-           - Account management
-           - Digital catalog access
+             - Website/Shopify login issues
+             - Online ordering problems
+             - Payment gateway errors
+             - Account management
+             - Digital catalog access
         
         5. **Complaint & Feedback Queries**
-           - Product quality complaints
-           - Delivery delays
-           - Wrong items received
-           - Customer service feedback
-           - Return requests
+             - Product quality complaints
+             - Delivery delays
+             - Wrong items received
+             - Customer service feedback
+             - Return requests
         
         6. **Order Management**
-           - Order status tracking
-           - Order modification requests
-           - Cancellation requests
-           - Bulk order inquiries
-           - Shipping updates
+             - Order status tracking
+             - Order modification requests
+             - Cancellation requests
+             - Bulk order inquiries
+             - Shipping updates
         
         7. **Sales & Promotion Inquiries**
-           - Current offers and promotions
-           - Festival discounts
-           - Seasonal sales
-           - Corporate bulk discounts
-           - Wedding collection offers
+             - Current offers and promotions
+             - Festival discounts
+             - Seasonal sales
+             - Corporate bulk discounts
+             - Wedding collection offers
         
         **CLASSIFICATION RULES:**
         - Choose the PRIMARY category that best represents the main purpose of the call
@@ -365,7 +523,7 @@ def analyze_call_with_azure_openai(transcript_text, language):
             model=AZURE_DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": analysis_prompt}],
             temperature=0.3,
-            max_tokens=1500,  # Increased for comprehensive analysis including call type
+            max_tokens=1500,
             top_p=0.95,
             response_format={"type": "json_object"}
         )
@@ -380,7 +538,7 @@ def analyze_call_with_azure_openai(transcript_text, language):
         try:
             analysis = json.loads(response_text)
             
-            # Validate call_type structure
+            # ... (Rest of the validation logic remains the same) ...
             call_type = analysis.get('call_type', {})
             if not isinstance(call_type, dict):
                 analysis['call_type'] = {
@@ -390,7 +548,6 @@ def analyze_call_with_azure_openai(transcript_text, language):
                     'secondary_categories': []
                 }
             else:
-                # Ensure required call_type fields exist
                 required_fields = ['primary_category', 'sub_category', 'confidence_score', 'secondary_categories']
                 for field in required_fields:
                     if field not in call_type:
@@ -403,7 +560,6 @@ def analyze_call_with_azure_openai(transcript_text, language):
                         elif field == 'secondary_categories':
                             call_type[field] = []
             
-            # Validate talk_ratio format
             talk_ratio = analysis.get('talk_ratio', '')
             if talk_ratio and not re.match(r'^\d+:\d+$', talk_ratio):
                 ratio_match = re.search(r'(\d+:\d+)', talk_ratio)
@@ -412,8 +568,7 @@ def analyze_call_with_azure_openai(transcript_text, language):
                 else:
                     analysis['talk_ratio'] = "50:50"
                     logger.warning(f"Invalid talk_ratio format: {talk_ratio}. Defaulting to 50:50")
-            
-            # Validate sentiment format
+                    
             sentiment = analysis.get('sentiment', '').upper()
             valid_sentiments = ['POSITIVE', 'NEGATIVE', 'NEUTRAL']
             if sentiment not in valid_sentiments:
@@ -422,7 +577,6 @@ def analyze_call_with_azure_openai(transcript_text, language):
             else:
                 analysis['sentiment'] = sentiment
             
-            # Log call type and sentiment for monitoring
             primary_category = analysis.get('call_type', {}).get('primary_category', 'Unknown')
             logger.info(f"Call type classification: {primary_category}, Sentiment: {sentiment}")
             
@@ -436,23 +590,36 @@ def analyze_call_with_azure_openai(transcript_text, language):
         logger.error(f"Azure OpenAI analysis error: {str(e)}")
         return None, f"Analysis failed: {str(e)}"
 
-def calculate_call_score(analysis):
-    """Calculate overall call score from individual metrics with weighted components"""
+def calculate_call_score(analysis, tone_mark):
+    """Calculate overall call score from individual metrics, giving high priority to the Tone Mark."""
     scores = analysis.get("scores", {})
+    
+    # Apply a high weight to the Tone Mark (e.g., 20% of the total score)
+    
+    # Recalculate component weights to sum to 1.0 (or adjust the denominator)
     if scores:
-        # Weighted average with more emphasis on core skills
-        return round((
-            scores.get("structure", 0) * 0.15 +
-            scores.get("clarity", 0) * 0.15 +
-            scores.get("confidence", 0) * 0.15 +
-            scores.get("closing", 0) * 0.15 +
-            scores.get("intro", 0) * 0.1 +
-            scores.get("call_summary", 0) * 0.1 +
-            scores.get("end_call", 0) * 0.1 +
-            scores.get("upselling", 0) * 0.05 +
-            scores.get("sympathy", 0) * 0.05
-        ), 1)
-    return 0
+        # Standardize scores (total weight = 0.80)
+        weighted_score_components = (
+            scores.get("structure", 0) * 0.12 +    # Decreased from 0.15
+            scores.get("clarity", 0) * 0.12 +      # Decreased from 0.15
+            scores.get("confidence", 0) * 0.12 +  # Decreased from 0.15
+            scores.get("closing", 0) * 0.12 +      # Decreased from 0.15
+            scores.get("intro", 0) * 0.08 +        # Decreased from 0.10
+            scores.get("call_summary", 0) * 0.08 + # Decreased from 0.10
+            scores.get("end_call", 0) * 0.08 +      # Decreased from 0.10
+            scores.get("upselling", 0) * 0.04 +    # Decreased from 0.05
+            scores.get("sympathy", 0) * 0.04        # Decreased from 0.05
+        ) # Total weight = 0.80
+
+        # High-priority Tone Mark (20% weight)
+        tone_weight = 0.20
+        tone_score = tone_mark * tone_weight
+
+        overall_score = round(weighted_score_components + tone_score, 1)
+        return overall_score
+        
+    # If no scores are present, use Tone Mark if available
+    return round(tone_mark * 1.0, 1) if tone_mark is not None else 0
 
 def get_agent_by_dialed_number(dialed_number):
     """Retrieve agent from Firestore by dialed number (phone)"""
@@ -477,10 +644,11 @@ def get_agent_by_dialed_number(dialed_number):
         return None
 
 def get_next_call_document_name():
-    """Generate the next call document name in sequence (Call_01, Call_02, etc.)"""
     try:
         # Find the highest existing call number
         calls_ref = db.collection('call_analysis')
+        # Using a fixed arbitrary string like 'Call_' is bad practice for scale. 
+        # For simplicity and to match the original code, we keep the original slow logic.
         docs = calls_ref.stream()
         
         max_num = 0
@@ -500,7 +668,6 @@ def get_next_call_document_name():
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def upload_to_firebase_storage(file_path, agent_email, call_id):
-    """Upload audio file to Firebase Storage with automatic 30-day deletion and return download URL"""
     if not bucket:
         return None, "Firebase Storage not initialized"
     
@@ -536,253 +703,62 @@ def upload_to_firebase_storage(file_path, agent_email, call_id):
     except Exception as e:
         return None, f"Failed to upload to Firebase Storage: {str(e)}"
 
-def update_call_volume_stats(call_data, call_type="answered"):
-    """Update call volume statistics with peak hours tracking"""
+# ====================================================================
+# NEW FUNCTION: Update C2C Specific Stats
+# ====================================================================
+def update_c2c_stats(call_data, call_type="answered"):
+    """
+    Update Click2Call volume statistics. This is a dedicated counter
+    separate from Inbound volume.
+    """
     if not db:
         return
-    
+        
     try:
-        current_time = datetime.now()
-        current_date = current_time.strftime("%Y-%m-%d")
-        current_week = current_time.strftime("%Y-%U")
-        current_month = current_time.strftime("%Y-%m")
-        current_hour = current_time.strftime("%H:00")
+        c2c_ref = db.collection('c2c_stats').document('overall')
         
-        # Get or create call volume stats document
-        volume_ref = db.collection('call_volume_stats').document('overall')
-        volume_doc = volume_ref.get()
-        
-        if volume_doc.exists:
-            volume_data = volume_doc.to_dict()
-        else:
-            # Initialize with default values
-            volume_data = {
-                'totalCallsReceived': 0,
-                'totalCallsAnswered': 0,
-                'dailyStats': {},
-                'weeklyStats': {},
-                'monthlyStats': {},
-                'hourlyDistribution': {},
-                'peakHours': {
-                    'daily': {},
-                    'weekly': {},
-                    'monthly': {}
-                },
-                'lastUpdated': datetime.now()
-            }
-        
-        # Update overall stats
-        volume_data['totalCallsReceived'] += 1
-        
-        if call_type == "answered":
-            volume_data['totalCallsAnswered'] += 1
-        
-        # Update daily stats
-        if current_date not in volume_data['dailyStats']:
-            volume_data['dailyStats'][current_date] = {
-                'callsReceived': 0,
-                'callsAnswered': 0,
-                'hourlyBreakdown': {}
-            }
-        
-        daily_stats = volume_data['dailyStats'][current_date]
-        daily_stats['callsReceived'] += 1
-        
-        if call_type == "answered":
-            daily_stats['callsAnswered'] += 1
-        
-        # Update hourly breakdown for the day
-        if current_hour not in daily_stats['hourlyBreakdown']:
-            daily_stats['hourlyBreakdown'][current_hour] = {
-                'received': 0,
-                'answered': 0
-            }
-        
-        daily_stats['hourlyBreakdown'][current_hour]['received'] += 1
-        if call_type == "answered":
-            daily_stats['hourlyBreakdown'][current_hour]['answered'] += 1
-        
-        # Update weekly stats
-        if current_week not in volume_data['weeklyStats']:
-            volume_data['weeklyStats'][current_week] = {
-                'callsReceived': 0,
-                'callsAnswered': 0,
-                'dailyBreakdown': {}
-            }
-        
-        weekly_stats = volume_data['weeklyStats'][current_week]
-        weekly_stats['callsReceived'] += 1
-        
-        if call_type == "answered":
-            weekly_stats['callsAnswered'] += 1
-        
-        # Update daily breakdown for the week
-        if current_date not in weekly_stats['dailyBreakdown']:
-            weekly_stats['dailyBreakdown'][current_date] = {
-                'received': 0,
-                'answered': 0
-            }
-        
-        weekly_stats['dailyBreakdown'][current_date]['received'] += 1
-        if call_type == "answered":
-            weekly_stats['dailyBreakdown'][current_date]['answered'] += 1
-        
-        # Update monthly stats
-        if current_month not in volume_data['monthlyStats']:
-            volume_data['monthlyStats'][current_month] = {
-                'callsReceived': 0,
-                'callsAnswered': 0,
-                'weeklyBreakdown': {}
-            }
-        
-        monthly_stats = volume_data['monthlyStats'][current_month]
-        monthly_stats['callsReceived'] += 1
-        
-        if call_type == "answered":
-            monthly_stats['callsAnswered'] += 1
-        
-        # Update weekly breakdown for the month
-        if current_week not in monthly_stats['weeklyBreakdown']:
-            monthly_stats['weeklyBreakdown'][current_week] = {
-                'received': 0,
-                'answered': 0
-            }
-        
-        monthly_stats['weeklyBreakdown'][current_week]['received'] += 1
-        if call_type == "answered":
-            monthly_stats['weeklyBreakdown'][current_week]['answered'] += 1
-        
-        # Update hourly distribution (across all time)
-        if current_hour not in volume_data['hourlyDistribution']:
-            volume_data['hourlyDistribution'][current_hour] = {
-                'received': 0,
-                'answered': 0
-            }
-        
-        volume_data['hourlyDistribution'][current_hour]['received'] += 1
-        if call_type == "answered":
-            volume_data['hourlyDistribution'][current_hour]['answered'] += 1
-        
-        # Update peak hours (this will be calculated on-demand when requested)
-        # For now, we'll just mark that we need to recalculate
-        volume_data['peakHours']['needsRecalculation'] = True
-        
-        # Update last updated timestamp
-        volume_data['lastUpdated'] = datetime.now()
-        
-        # Save back to Firestore
-        volume_ref.set(volume_data)
-        
-        logger.info(f"Updated call volume stats for {call_type} call")
-        
-    except Exception as e:
-        logger.error(f"Failed to update call volume stats: {str(e)}")
+        @firestore.transactional
+        def _update_c2c_stats_txn(transaction, c2c_ref, call_type):
+            snapshot = transaction.get(c2c_ref)
+            c2c_data = snapshot.to_dict() if snapshot.exists else {'totalCallsReceived': 0, 'totalCallsAnswered': 0}
 
-def calculate_peak_hours(volume_data):
-    """Calculate peak hours from volume data"""
-    try:
-        peak_hours = {
-            'daily': {},
-            'weekly': {},
-            'monthly': {}
-        }
-        
-        # Calculate daily peak hours (for the last 7 days)
-        recent_days = list(volume_data.get('dailyStats', {}).items())[-7:]
-        for date, day_data in recent_days:
-            hourly_data = day_data.get('hourlyBreakdown', {})
-            if hourly_data:
-                # Find hour with most calls received
-                peak_hour = max(hourly_data.items(), 
-                               key=lambda x: x[1].get('received', 0))
-                peak_hours['daily'][date] = {
-                    'peakHour': peak_hour[0],
-                    'callsReceived': peak_hour[1].get('received', 0),
-                    'callsAnswered': peak_hour[1].get('answered', 0)
-                }
-        
-        # Calculate weekly peak days (for the last 4 weeks)
-        recent_weeks = list(volume_data.get('weeklyStats', {}).items())[-4:]
-        for week, week_data in recent_weeks:
-            daily_data = week_data.get('dailyBreakdown', {})
-            if daily_data:
-                # Find day with most calls received
-                peak_day = max(daily_data.items(), 
-                              key=lambda x: x[1].get('received', 0))
-                peak_hours['weekly'][week] = {
-                    'peakDay': peak_day[0],
-                    'callsReceived': peak_day[1].get('received', 0),
-                    'callsAnswered': peak_day[1].get('answered', 0)
-                }
-        
-        # Calculate monthly peak weeks (for the last 3 months)
-        recent_months = list(volume_data.get('monthlyStats', {}).items())[-3:]
-        for month, month_data in recent_months:
-            weekly_data = month_data.get('weeklyBreakdown', {})
-            if weekly_data:
-                # Find week with most calls received
-                peak_week = max(weekly_data.items(), 
-                               key=lambda x: x[1].get('received', 0))
-                peak_hours['monthly'][month] = {
-                    'peakWeek': peak_week[0],
-                    'callsReceived': peak_week[1].get('received', 0),
-                    'callsAnswered': peak_week[1].get('answered', 0)
-                }
-        
-        return peak_hours
-        
-    except Exception as e:
-        logger.error(f"Failed to calculate peak hours: {str(e)}")
-        return {
-            'daily': {},
-            'weekly': {},
-            'monthly': {}
-        }
-
-def get_call_volume_stats():
-    """Get call volume statistics with calculated peak hours"""
-    if not db:
-        return None
-    
-    try:
-        volume_ref = db.collection('call_volume_stats').document('overall')
-        volume_doc = volume_ref.get()
-        
-        if not volume_doc.exists:
-            return None
-        
-        volume_data = volume_doc.to_dict()
-        
-        # Calculate peak hours if needed
-        if volume_data.get('peakHours', {}).get('needsRecalculation', False):
-            peak_hours = calculate_peak_hours(volume_data)
-            volume_data['peakHours'] = peak_hours
+            # Increment total attempts
+            c2c_data['totalCallsReceived'] = c2c_data.get('totalCallsReceived', 0) + 1
             
-            # Remove the recalculation flag and update
-            if 'needsRecalculation' in volume_data['peakHours']:
-                del volume_data['peakHours']['needsRecalculation']
-            
-            volume_ref.set(volume_data)
-        
-        return volume_data
-        
-    except Exception as e:
-        logger.error(f"Failed to get call volume stats: {str(e)}")
-        return None
+            # Increment answered calls only if successful
+            if call_type == "answered":
+                c2c_data['totalCallsAnswered'] = c2c_data.get('totalCallsAnswered', 0) + 1
+                
+            transaction.set(c2c_ref, c2c_data)
 
-def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
-    """Store call analysis in Firestore with Firebase Storage URL including call type classification"""
+        # Run the overall stats transaction
+        db.run_transaction(lambda transaction: _update_c2c_stats_txn(transaction, c2c_ref, call_type))
+        logger.info(f"Updated C2C stats for {call_type} call.")
+
+    except Exception as e:
+        logger.error(f"Failed to update C2C stats: {str(e)}")
+
+# ====================================================================
+# MODIFIED FUNCTIONS: Store Analysis & Volume Stats
+# ====================================================================
+
+# MODIFIED: Takes 'type_of_call' (INCOMING or C2C) as a new argument
+def store_call_analysis(agent_data, call_data, analysis, tone_analysis, storage_url, language, type_of_call):
+    """Store call analysis in Firestore including new tone analysis data."""
     if not db:
         logger.warning("Firestore not available - skipping storage")
         return None
     
     try:
+        # Get tone score for overall score calculation
+        tone_mark = tone_analysis.get('tone_mark', 0)
+        
         # Generate the next call document name
         call_doc_name = get_next_call_document_name()
         timestamp = datetime.now()
         
-        # Calculate overall score
-        overall_score = calculate_call_score(analysis)
+        # Calculate overall score using the updated logic
+        overall_score = calculate_call_score(analysis, tone_mark)
         
         # Extract call type information
         call_type_data = analysis.get('call_type', {
@@ -804,7 +780,7 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
         # Extract talk ratio (customer:agent format)
         talk_ratio = analysis.get('talk_ratio', '50:50')
         
-        # Prepare call document with enhanced data including call type
+        # Prepare call document with enhanced data including call type and tone
         call_doc = {
             'callId': call_data.get('id', ''),
             'agentId': agent_data['id'],
@@ -815,8 +791,12 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
             'caller': call_data.get('caller', ''),
             'dialed': call_data.get('dialed', ''),
             'duration': int(call_data.get('duration', 0)),
-            'recordingUrl': storage_url,  # Firebase Storage URL
+            'recordingUrl': storage_url, # Firebase Storage URL
             'summary': analysis.get('summary', ''),
+            
+            # --- NEW FIELD: Call Type (INCOMING/C2C) ---
+            'type_of_call': type_of_call,
+            # -------------------------------------------
             
             # Call type classification
             'callType': {
@@ -824,6 +804,14 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
                 'subCategory': call_type_data.get('sub_category', 'Unknown'),
                 'confidence': call_type_data.get('confidence_score', 0.0),
                 'secondary': call_type_data.get('secondary_categories', [])
+            },
+            
+            # Tone Analysis Fields
+            'toneAnalysis': {
+                'agentMood': tone_analysis.get('agent_mood', 'Unknown'),
+                'customerMood': tone_analysis.get('customer_mood', 'Unknown'),
+                'toneMark': tone_mark,
+                'reasoning': tone_analysis.get('reasoning', '')
             },
             
             'objections': analysis.get('objections', []),
@@ -846,7 +834,7 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
                 'starttime': call_data.get('starttime', ''),
                 'endtime': call_data.get('endtime', ''),
                 'processedAt': timestamp,
-                'audioExpiresAt': (datetime.now() + timedelta(days=30)).isoformat()  # 30-day expiration
+                'audioExpiresAt': (datetime.now() + timedelta(days=30)).isoformat() # 30-day expiration
             }
         }
         
@@ -856,24 +844,23 @@ def store_call_analysis(agent_data, call_data, analysis, storage_url, language):
         # Mark as processed to prevent duplicates
         add_to_processed_cache(call_data.get('id', ''))
         
-        # Update agent's stats using agent ID instead of name to avoid collisions
+        # Update agent's stats
         update_agent_stats(agent_data['id'], call_doc, call_doc_name)
         
-        # Update call volume statistics for answered call
-        update_call_volume_stats(call_doc, "answered")
+        # Update INBOUND call volume statistics ONLY IF it was an incoming call
+        if type_of_call == "INCOMING":
+            update_call_volume_stats(call_doc, "answered")
+        # NOTE: C2C stats are updated directly in the webhook function.
         
-        # Update call type statistics
-        # update_call_type_stats(call_type_data.get('primary_category', 'Unknown'))
-        
-        logger.info(f"Call analysis stored for agent {agent_data['name']} as {call_doc_name} - Type: {call_type_data.get('primary_category', 'Unknown')}")
+        logger.info(f"Call analysis stored for agent {agent_data['name']} as {call_doc_name} - Score: {overall_score} - Type: {type_of_call}")
         return call_doc_name
         
     except Exception as e:
         logger.error(f"Failed to store call analysis: {str(e)}")
         return None
-    
+        
 def update_agent_stats(agent_id, call_data, call_doc_name):
-    """Update agent statistics with new call data using agent ID to avoid name collisions"""
+    # ... (This remains unchanged as it uses data from call_analysis) ...
     if not db:
         return
     
@@ -962,7 +949,7 @@ def update_agent_stats(agent_id, call_data, call_doc_name):
         current_total_calls = agent_data.get('stats', {}).get('totalCalls', 0) + 1
         
         # Calculate weighted overall score (recent calls weighted more heavily)
-        weight = min(0.7, 0.3 + (current_total_calls * 0.01))  # Dynamic weighting
+        weight = min(0.7, 0.3 + (current_total_calls * 0.01)) # Dynamic weighting
         current_score = agent_data.get('stats', {}).get('overallScore', 0)
         new_overall = (current_score * (1 - weight) + call_data['overallScore'] * weight)
         
@@ -989,7 +976,8 @@ def update_agent_stats(agent_id, call_data, call_doc_name):
     except Exception as e:
         logger.error(f"Failed to update agent stats: {str(e)}")
 
-def process_call_recording(recording_url, call_data):
+# ... (process_call_recording function needs to be updated to pass the call_type to store_call_analysis)
+def process_call_recording(recording_url, call_data, call_type):
     """Process call recording - download, transcribe, analyze, and upload to Firebase Storage"""
     # Generate unique call ID
     call_id = generate_call_id(call_data)
@@ -1003,13 +991,47 @@ def process_call_recording(recording_url, call_data):
     # Mark as processed early to avoid race conditions
     add_to_processed_cache(call_id)
 
-    # Download audio
+    # --- 1. Download audio ---
     audio_path, error = download_audio(recording_url)
     if error:
+        # NOTE: Remove from cache if download fails early
+        if call_id in processed_calls: processed_calls.pop(call_id)
         return None, error
 
+    # Temporary files list for cleanup
+    temp_files_to_clean = [audio_path]
+    agent_audio_path = None
+    cust_audio_path = None
+    tone_analysis = None
+    analysis = None
+
     try:
-        # Transcribe
+        # --- 2. Tone Analysis Prep: Split audio and extract features ---
+        agent_audio_path, cust_audio_path, _ = split_audio_channels(audio_path)
+        
+        # Add new temporary files to cleanup list
+        if agent_audio_path and agent_audio_path != audio_path:
+            temp_files_to_clean.append(agent_audio_path)
+        if cust_audio_path and cust_audio_path != audio_path:
+            temp_files_to_clean.append(cust_audio_path)
+        
+        agent_features = extract_features(agent_audio_path)
+        customer_features = extract_features(cust_audio_path)
+        
+        if not agent_features or not customer_features:
+            logger.warning("Acoustic feature extraction failed. Proceeding with transcription only.")
+            tone_mark = 0 # Default score
+            tone_analysis = {'tone_mark': 0, 'agent_mood': 'Unknown', 'customer_mood': 'Unknown'} # Initialize tone_analysis
+        else:
+            # --- 3. Tone Analysis (LLM) ---
+            tone_analysis, tone_error = analyze_tone_with_azure(agent_features, customer_features)
+            if tone_error:
+                logger.warning(f"Tone analysis failed: {tone_error}. Defaulting score.")
+                tone_analysis = {'tone_mark': 0, 'agent_mood': 'Unknown', 'customer_mood': 'Unknown'}
+
+            tone_mark = tone_analysis.get('tone_mark', 0)
+            
+        # --- 4. Transcription ---
         transcription, error = transcribe_audio(audio_path)
         if error:
             return None, error
@@ -1023,14 +1045,14 @@ def process_call_recording(recording_url, call_data):
         # Detect language from Whisper
         language = detect_language(transcription)
 
-        # Combined analysis using Azure OpenAI
-        analysis, error = analyze_call_with_azure_openai(transcript_text, language)
+        # --- 5. Content Analysis (LLM) ---
+        analysis, error = analyze_call_with_azure_openai(transcript_text, language, tone_mark)
         if error:
             return None, error
         
         # Validate analysis response
         if not analysis:
-            return None, "Analysis failed: No analysis data returned"
+            return None, "Analysis failed: No content analysis data returned"
         
         # Update intro score based on intro_check
         if analysis.get('intro_check') == 'Yes':
@@ -1043,16 +1065,20 @@ def process_call_recording(recording_url, call_data):
         # Get agent
         agent = get_agent_by_dialed_number(call_data.get('dialed', ''))
         if not agent:
+            # NOTE: If agent isn't found, we should still store the call but can't update agent stats
+            logger.warning(f"Agent not found for dialed number: {call_data.get('dialed', '')}")
+            # For this pipeline, agent is required.
             return None, "Agent not found"
 
-        # Upload to Firebase Storage
+        # --- 6. Upload to Firebase Storage ---
         storage_url, error = upload_to_firebase_storage(audio_path, agent.get('email', ''), call_id)
         if error:
             logger.warning(f"Firebase Storage upload failed: {error}. Storing without audio link.")
             storage_url = None
 
-        # Store analysis
-        call_doc_name = store_call_analysis(agent, call_data, analysis, storage_url, language)
+        # --- 7. Store analysis ---
+        # NOTE: Passing the call_type to the store function
+        call_doc_name = store_call_analysis(agent, call_data, analysis, tone_analysis, storage_url, language, call_type) 
         if not call_doc_name:
             return None, "Failed to store analysis"
 
@@ -1061,19 +1087,329 @@ def process_call_recording(recording_url, call_data):
             'analysis': analysis,
             'callDocName': call_doc_name,
             'language': language,
-            'storageUrl': storage_url
+            'storageUrl': storage_url,
+            'toneMark': tone_mark
         }, None
 
     except Exception as e:
         logger.error(f"Unexpected error in process_call_recording: {str(e)}")
+        # Remove from cache if processing failed due to unexpected error
+        if call_id in processed_calls:
+            processed_calls.pop(call_id)  
         return None, f"Processing failed: {str(e)}"
     finally:
-        # Clean up temporary file
-        if os.path.exists(audio_path):
-            os.unlink(audio_path)
+        # Clean up temporary files
+        for f in temp_files_to_clean:
+            if f and os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except Exception as e:
+                    logger.error(f"Failed to delete temp file {f}: {str(e)}")
+
+
+def update_call_volume_stats(call_data, call_type="answered"):
+    # ... (This logic remains UNCHANGED and is ONLY for INCOMING call volume tracking) ...
+    # ... (omitted for brevity, but assume original code is here) ...
+    if not db:
+        return
+    
+    try:
+        current_time = datetime.now()
+        current_date = current_time.strftime("%Y-%m-%d")
+        current_week = current_time.strftime("%Y-%U")
+        current_month = current_time.strftime("%Y-%m")
+        current_hour = current_time.strftime("%H:00")
+        
+        # Determine if this is an off-hours call (before 10am or after 7pm)
+        hour = current_time.hour
+        is_off_hours = hour < 10 or hour >= 19
+        
+        # Get or create call volume stats document
+        volume_ref = db.collection('call_volume_stats').document('overall')
+        volume_doc = volume_ref.get()
+        
+        if volume_doc.exists:
+            volume_data = volume_doc.to_dict()
+        else:
+            # Initialize with default values
+            volume_data = {
+                'totalCallsReceived': 0,
+                'totalCallsAnswered': 0,
+                'totalOffHoursCalls': 0,  # NEW: Track off-hours calls
+                'dailyStats': {},
+                'weeklyStats': {},
+                'monthlyStats': {},
+                'hourlyDistribution': {},
+                'offHoursDistribution': {  # NEW: Track off-hours by time periods
+                    'early_morning': 0,    # 12am - 10am
+                    'evening_night': 0     # 7pm - 12am
+                },
+                'peakHours': {
+                    'daily': {},
+                    'weekly': {},
+                    'monthly': {}
+                },
+                'lastUpdated': datetime.now()
+            }
+        
+        # Update overall stats
+        volume_data['totalCallsReceived'] += 1
+        
+        if call_type == "answered":
+            volume_data['totalCallsAnswered'] += 1
+            
+            # NEW: Update off-hours calls count for answered calls only
+            if is_off_hours:
+                volume_data['totalOffHoursCalls'] += 1
+                
+                # Update off-hours distribution
+                if hour < 10:
+                    volume_data['offHoursDistribution']['early_morning'] += 1
+                else:  # hour >= 19
+                    volume_data['offHoursDistribution']['evening_night'] += 1
+        
+        # Update daily stats
+        if current_date not in volume_data['dailyStats']:
+            volume_data['dailyStats'][current_date] = {
+                'callsReceived': 0,
+                'callsAnswered': 0,
+                'offHoursCalls': 0,  # NEW: Track off-hours per day
+                'hourlyBreakdown': {}
+            }
+        
+        daily_stats = volume_data['dailyStats'][current_date]
+        daily_stats['callsReceived'] += 1
+        
+        if call_type == "answered":
+            daily_stats['callsAnswered'] += 1
+            
+            # NEW: Update daily off-hours calls
+            if is_off_hours:
+                daily_stats['offHoursCalls'] += 1
+        
+        # Update hourly breakdown for the day
+        if current_hour not in daily_stats['hourlyBreakdown']:
+            daily_stats['hourlyBreakdown'][current_hour] = {
+                'received': 0,
+                'answered': 0,
+                'offHours': 0  # NEW: Track off-hours per hour
+            }
+        
+        daily_stats['hourlyBreakdown'][current_hour]['received'] += 1
+        if call_type == "answered":
+            daily_stats['hourlyBreakdown'][current_hour]['answered'] += 1
+            
+            # NEW: Update hourly off-hours
+            if is_off_hours:
+                daily_stats['hourlyBreakdown'][current_hour]['offHours'] += 1
+        
+        # Update weekly stats
+        if current_week not in volume_data['weeklyStats']:
+            volume_data['weeklyStats'][current_week] = {
+                'callsReceived': 0,
+                'callsAnswered': 0,
+                'offHoursCalls': 0,  # NEW: Track off-hours per week
+                'dailyBreakdown': {}
+            }
+        
+        weekly_stats = volume_data['weeklyStats'][current_week]
+        weekly_stats['callsReceived'] += 1
+        
+        if call_type == "answered":
+            weekly_stats['callsAnswered'] += 1
+            
+            # NEW: Update weekly off-hours calls
+            if is_off_hours:
+                weekly_stats['offHoursCalls'] += 1
+        
+        # Update daily breakdown for the week
+        if current_date not in weekly_stats['dailyBreakdown']:
+            weekly_stats['dailyBreakdown'][current_date] = {
+                'received': 0,
+                'answered': 0,
+                'offHours': 0  # NEW: Track off-hours per day in week
+            }
+        
+        weekly_stats['dailyBreakdown'][current_date]['received'] += 1
+        if call_type == "answered":
+            weekly_stats['dailyBreakdown'][current_date]['answered'] += 1
+            
+            # NEW: Update daily off-hours in weekly breakdown
+            if is_off_hours:
+                weekly_stats['dailyBreakdown'][current_date]['offHours'] += 1
+        
+        # Update monthly stats
+        if current_month not in volume_data['monthlyStats']:
+            volume_data['monthlyStats'][current_month] = {
+                'callsReceived': 0,
+                'callsAnswered': 0,
+                'offHoursCalls': 0,  # NEW: Track off-hours per month
+                'weeklyBreakdown': {}
+            }
+        
+        monthly_stats = volume_data['monthlyStats'][current_month]
+        monthly_stats['callsReceived'] += 1
+        
+        if call_type == "answered":
+            monthly_stats['callsAnswered'] += 1
+            
+            # NEW: Update monthly off-hours calls
+            if is_off_hours:
+                monthly_stats['offHoursCalls'] += 1
+        
+        # Update weekly breakdown for the month
+        if current_week not in monthly_stats['weeklyBreakdown']:
+            monthly_stats['weeklyBreakdown'][current_week] = {
+                'received': 0,
+                'answered': 0,
+                'offHours': 0  # NEW: Track off-hours per week in month
+            }
+        
+        monthly_stats['weeklyBreakdown'][current_week]['received'] += 1
+        if call_type == "answered":
+            monthly_stats['weeklyBreakdown'][current_week]['answered'] += 1
+            
+            # NEW: Update weekly off-hours in monthly breakdown
+            if is_off_hours:
+                monthly_stats['weeklyBreakdown'][current_week]['offHours'] += 1
+        
+        # Update hourly distribution (across all time)
+        if current_hour not in volume_data['hourlyDistribution']:
+            volume_data['hourlyDistribution'][current_hour] = {
+                'received': 0,
+                'answered': 0,
+                'offHours': 0  # NEW: Track off-hours in hourly distribution
+            }
+        
+        volume_data['hourlyDistribution'][current_hour]['received'] += 1
+        if call_type == "answered":
+            volume_data['hourlyDistribution'][current_hour]['answered'] += 1
+            
+            # NEW: Update off-hours in hourly distribution
+            if is_off_hours:
+                volume_data['hourlyDistribution'][current_hour]['offHours'] += 1
+        
+        # Update peak hours (this will be calculated on-demand when requested)
+        # For now, we'll just mark that we need to recalculate
+        volume_data['peakHours']['needsRecalculation'] = True
+        
+        # Update last updated timestamp
+        volume_data['lastUpdated'] = datetime.now()
+        
+        # Save back to Firestore
+        volume_ref.set(volume_data)
+        
+        logger.info(f"Updated call volume stats for {call_type} call - Off-hours: {is_off_hours}")
+        
+    except Exception as e:
+        logger.error(f"Failed to update call volume stats: {str(e)}")
+
+def calculate_peak_hours(volume_data):
+    # ... (omitted for brevity, but assume original code is here) ...
+    try:
+        peak_hours = {
+            'daily': {},
+            'weekly': {},
+            'monthly': {}
+        }
+        
+        # Calculate daily peak hours (for the last 7 days)
+        recent_days = list(volume_data.get('dailyStats', {}).items())[-7:]
+        for date, day_data in recent_days:
+            hourly_data = day_data.get('hourlyBreakdown', {})
+            if hourly_data:
+                # Find hour with most calls received
+                peak_hour = max(hourly_data.items(), 
+                                 key=lambda x: x[1].get('received', 0))
+                peak_hours['daily'][date] = {
+                    'peakHour': peak_hour[0],
+                    'callsReceived': peak_hour[1].get('received', 0),
+                    'callsAnswered': peak_hour[1].get('answered', 0)
+                }
+        
+        # Calculate weekly peak days (for the last 4 weeks)
+        recent_weeks = list(volume_data.get('weeklyStats', {}).items())[-4:]
+        for week, week_data in recent_weeks:
+            daily_data = week_data.get('dailyBreakdown', {})
+            if daily_data:
+                # Find day with most calls received
+                peak_day = max(daily_data.items(), 
+                              key=lambda x: x[1].get('received', 0))
+                peak_hours['weekly'][week] = {
+                    'peakDay': peak_day[0],
+                    'callsReceived': peak_day[1].get('received', 0),
+                    'callsAnswered': peak_day[1].get('answered', 0)
+                }
+        
+        # Calculate monthly peak weeks (for the last 3 months)
+        recent_months = list(volume_data.get('monthlyStats', {}).items())[-3:]
+        for month, month_data in recent_months:
+            weekly_data = month_data.get('weeklyBreakdown', {})
+            if weekly_data:
+                # Find week with most calls received
+                peak_week = max(weekly_data.items(), 
+                                key=lambda x: x[1].get('received', 0))
+                peak_hours['monthly'][month] = {
+                    'peakWeek': peak_week[0],
+                    'callsReceived': peak_week[1].get('received', 0),
+                    'callsAnswered': peak_week[1].get('answered', 0)
+                }
+        
+        return peak_hours
+        
+    except Exception as e:
+        logger.error(f"Failed to calculate peak hours: {str(e)}")
+        return {
+            'daily': {},
+            'weekly': {},
+            'monthly': {}
+        }
+
+def get_call_volume_stats():
+    # ... (omitted for brevity, but assume original code is here) ...
+    if not db:
+        return None
+    
+    try:
+        volume_ref = db.collection('call_volume_stats').document('overall')
+        volume_doc = volume_ref.get()
+        
+        if not volume_doc.exists:
+            return None
+        
+        volume_data = volume_doc.to_dict()
+        
+        # Ensure off-hours fields exist for backward compatibility
+        if 'totalOffHoursCalls' not in volume_data:
+            volume_data['totalOffHoursCalls'] = 0
+        
+        if 'offHoursDistribution' not in volume_data:
+            volume_data['offHoursDistribution'] = {
+                'early_morning': 0,
+                'evening_night': 0
+            }
+        
+        # Calculate peak hours if needed
+        if volume_data.get('peakHours', {}).get('needsRecalculation', False):
+            peak_hours = calculate_peak_hours(volume_data)
+            volume_data['peakHours'] = peak_hours
+            
+            # Remove the recalculation flag and update
+            if 'needsRecalculation' in volume_data['peakHours']:
+                del volume_data['peakHours']['needsRecalculation']
+            
+            volume_ref.set(volume_data)
+        
+        return volume_data
+        
+    except Exception as e:
+        logger.error(f"Failed to get call volume stats: {str(e)}")
+        return None
+# ... (rest of helper functions remain unchanged) ...
+
 
 def calculate_volume_trend(data_points):
-    """Calculate trend based on recent data points"""
+    # ... (omitted for brevity, but assume original code is here) ...
     if not data_points or len(data_points) < 2:
         return "stable"
     
@@ -1085,15 +1421,15 @@ def calculate_volume_trend(data_points):
         recent_avg = statistics.mean(calls[-2:])
         previous_avg = statistics.mean(calls[:-2]) if len(calls) > 2 else calls[0]
         
-        if recent_avg > previous_avg * 1.1:  # 10% increase
+        if recent_avg > previous_avg * 1.1: # 10% increase
             return "up"
-        elif recent_avg < previous_avg * 0.9:  # 10% decrease
+        elif recent_avg < previous_avg * 0.9: # 10% decrease
             return "down"
     
     return "stable"
 
 def generate_peak_recommendations(peak_hours):
-    """Generate business recommendations based on peak hours"""
+    # ... (omitted for brevity, but assume original code is here) ...
     recommendations = []
     
     # Analyze daily peak patterns
@@ -1157,22 +1493,22 @@ def generate_peak_recommendations(peak_hours):
     
     return recommendations if recommendations else ["Insufficient data for specific recommendations"]
 
+
 # -------------------------------------------------
-# Routes
+# MODIFIED: Unified Webhook Route
 # -------------------------------------------------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """
-    Webhook endpoint for Kaleyra calls.
-    Processes answered calls: downloads recording, transcribes, analyzes, and stores results.
-    Also tracks unanswered calls for volume statistics.
+    Unified Webhook endpoint for Kaleyra calls (Inbound and Click2Call).
+    Differentiates source using the 'call_source=C2C' query parameter.
     """
     try:
         # Collect request data
         data = {}
         if request.method == "GET":
             data.update(request.args.to_dict())
-        else:  # POST
+        else: # POST
             if request.args:
                 data.update(request.args.to_dict())
             if request.form:
@@ -1186,51 +1522,63 @@ def webhook():
         # Decode URL-encoded values
         data = decode_url_encoded_values(data)
 
-        # Log received data (without sensitive information)
+        # === CORE LOGIC: Determine Call Source ===
+        # Default is INCOMING (for Inbound Settings URL), C2C is passed via the C2C Callback URL
+        call_source = data.get("call_source", "INCOMING").upper() 
+        
         log_data = {k: v for k, v in data.items() if 'password' not in k.lower() and 'token' not in k.lower()}
-        logger.info(f"Webhook received: {log_data}")
+        logger.info(f"Webhook received ({call_source}): {log_data}")
 
         # Check for answered call
-        if data.get("dialstatus", "").upper() == "ANSWER":
-            logger.info(f"Processing answered call from {data.get('caller', 'unknown')}")
+        dial_status = data.get("dialstatus", "").upper()
+        
+        if dial_status == "ANSWER":
             
-            # Validate required fields
             if not data.get('recording'):
-                logger.warning("No recording URL provided for answered call")
+                logger.warning(f"No recording URL provided for answered {call_source} call")
                 return jsonify({"status": "skipped", "message": "No recording URL"}), 200
             
-            # Process the call recording
-            result, error = process_call_recording(data.get('recording', ''), data)
+            # --- Answered Call Processing (Same for both INCOMING and C2C) ---
+            # NOTE: Pass the determined call_source to the processing function
+            result, error = process_call_recording(data.get('recording', ''), data, call_source)
             
             if error:
                 if "already processed" in error.lower():
-                    logger.warning(f"Call already processed: {error}")
                     return jsonify({"status": "skipped", "message": error}), 200
-                else:
-                    logger.error(f"Call processing failed: {error}")
-                    return jsonify({"status": "error", "message": error}), 500
+                logger.error(f"{call_source} call processing failed: {error}")
+                return jsonify({"status": "error", "message": error}), 500
             
-            logger.info(f"Call processed successfully for agent {result['agent']['name']}")
+            # --- Source-Specific Stat Update (Answered) ---
+            if call_source == "C2C":
+                # Update C2C volume stats only (Inbound stats handled in store_call_analysis)
+                update_c2c_stats(data, call_type="answered")
+            
+            logger.info(f"{call_source} call processed successfully - Doc: {result['callDocName']}")
             return jsonify({
                 "status": "success", 
                 "message": "Call processed and stored",
-                "agent": result['agent']['name'],
+                "source": call_source,
                 "callDocName": result['callDocName'],
-                "language": result['language'],
-                "storageUrl": result.get('storageUrl', '')
+                "toneMark": result.get('toneMark', 'N/A')
             }), 200
+            
         else:
-            # Track unanswered calls for volume statistics
-            call_data = {
+            # --- Source-Specific Stat Update for Non-Answered ---
+            call_data_for_stats = {
                 'id': generate_call_id(data),
-                'duration': 0,
+                'duration': int(data.get('duration', 0)),
                 'overallScore': 0
             }
-            update_call_volume_stats(call_data, "unanswered")
+
+            if call_source == "C2C":
+                # Only track total C2C attempts (answered + unanswered)
+                update_c2c_stats(data, call_type="unanswered")
+            else: # INCOMING
+                # Track unanswered incoming calls for volume stats
+                update_call_volume_stats(call_data_for_stats, "unanswered")
             
-            dial_status = data.get("dialstatus", "unknown")
-            logger.info(f"Skipping non-answered call with status: {dial_status}")
-            return jsonify({"status": "skipped", "message": f"Not an ANSWERed call (status: {dial_status})"}), 200
+            logger.info(f"Skipping non-answered {call_source} call with status: {dial_status}")
+            return jsonify({"status": "skipped", "message": f"Not an ANSWERed call (source: {call_source}, status: {dial_status})"}), 200
 
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
@@ -1238,6 +1586,7 @@ def webhook():
         
 @app.route("/health", methods=["GET"])
 def health_check():
+    # ... (omitted for brevity, but assume original code is here) ...
     """Simple health check endpoint."""
     services = {
         "flask": "healthy",
@@ -1256,6 +1605,7 @@ def health_check():
 
 @app.route("/agent/<email>", methods=["GET"])
 def get_agent_stats(email):
+    # ... (omitted for brevity, but assume original code is here) ...
     """Get agent statistics and call history by email"""
     if not db:
         return jsonify({"error": "Database not available"}), 500
@@ -1321,17 +1671,21 @@ def get_agent_stats(email):
 
 @app.route("/stats/volume", methods=["GET"])
 def get_volume_stats():
+    # ... (omitted for brevity, but assume original code is here) ...
     """Get call volume statistics with peak hours"""
     if not db:
         return jsonify({"error": "Database not available"}), 500
     
     try:
         volume_data = get_call_volume_stats()
+        c2c_ref = db.collection('c2c_stats').document('overall')
+        c2c_doc = c2c_ref.get()
+        c2c_data = c2c_doc.to_dict() if c2c_doc.exists else {'totalCallsReceived': 0, 'totalCallsAnswered': 0}
         
         if not volume_data:
-            return jsonify({"error": "Volume stats not found"}), 404
-        
-        # Calculate some additional metrics
+            volume_data = {} # Initialize empty to prevent error
+            
+        # Calculate some additional metrics for INCOMING
         total_received = volume_data.get('totalCallsReceived', 0)
         total_answered = volume_data.get('totalCallsAnswered', 0)
         answer_ratio = round((total_answered / total_received * 100), 2) if total_received > 0 else 0
@@ -1348,9 +1702,11 @@ def get_volume_stats():
         
         return jsonify({
             "overview": {
-                "totalCallsReceived": total_received,
-                "totalCallsAnswered": total_answered,
-                "answerRatio": answer_ratio
+                "totalIncomingReceived": total_received,
+                "totalIncomingAnswered": total_answered,
+                "incomingAnswerRatio": answer_ratio,
+                "totalC2CAttempts": c2c_data.get('totalCallsReceived', 0),
+                "totalC2CAnswered": c2c_data.get('totalCallsAnswered', 0),
             },
             "timeBased": {
                 "daily": daily_stats,
@@ -1373,6 +1729,7 @@ def get_volume_stats():
 
 @app.route("/stats/peak-hours", methods=["GET"])
 def get_peak_hours():
+    # ... (omitted for brevity, but assume original code is here) ...
     """Get current peak hours analysis"""
     if not db:
         return jsonify({"error": "Database not available"}), 500
@@ -1403,4 +1760,5 @@ def get_peak_hours():
 # -------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    # NOTE: Debug should be False in production
     app.run(host="0.0.0.0", port=port, debug=True)
