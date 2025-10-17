@@ -27,6 +27,7 @@ import numpy as np
 import soundfile as sf
 import scipy.io.wavfile as wavfile # <-- NEW: For reading/writing WAV
 from pydub import AudioSegment      # <-- NEW: For MP3 to WAV conversion
+import pytz                         # <-- NEW: For Time Zone Handling (IST)
 # =====================================
 
 load_dotenv()
@@ -174,31 +175,33 @@ def add_to_processed_cache(call_id):
 def download_audio(url):
     """
     Download audio (MP3) from URL, convert to mono WAV, and return temporary file path
-    with retry logic. This ensures compatibility for simple scipy processing and transcription.
+    with retry logic. Robust against partial downloads/corrupted files.
     """
     temp_mp3_path = None
     temp_wav_path = None
     try:
-        # 1. Download the file as MP3
-        response = requests.get(url, stream=True, timeout=360)
-        response.raise_for_status()
+        # 1. Download the file. Request content and write it all at once for robustness.
+        response = requests.get(url, timeout=360) 
+        response.raise_for_status() # Raise error for bad status codes (4xx or 5xx)
         
+        # Create a temporary MP3 file
         temp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-        for chunk in response.iter_content(chunk_size=8192):
-            temp_mp3.write(chunk)
+        temp_mp3.write(response.content) # Write all content at once
         temp_mp3.close()
         temp_mp3_path = temp_mp3.name
         
-        # 2. Convert to WAV for easier handling by scipy/numpy and ensure mono for feature extraction
-        # pydub requires ffmpeg/libav to be installed in the environment (Render usually has this)
-        audio = AudioSegment.from_file(temp_mp3_path, format="mp3")
-        
-        # Ensure it's mono (for safer feature extraction)
-        if audio.channels > 1:
-            # Note: This effectively mixes stereo to mono, losing channel separation if needed later.
-            # The next step split_audio_channels_scipy will handle channel separation from stereo data
-            # if audio.channels > 1, but we use the mixed mono for transcription
-            audio = audio.set_channels(1) 
+        # 2. Convert to WAV for easier handling by scipy/numpy
+        # CRITICAL: Explicitly handle the potential decoding error here (Header Missing)
+        try:
+            # Check file size before pydub to detect tiny files (e.g., failed downloads)
+            if os.path.getsize(temp_mp3_path) < 1024: 
+                 raise requests.exceptions.RequestException("Downloaded file is empty or corrupted (size < 1KB).")
+
+            audio = AudioSegment.from_file(temp_mp3_path, format="mp3") 
+        except Exception as audio_err:
+            logger.error(f"Pydub/FFmpeg decoding failed for {url}: {audio_err}")
+            # Re-raise the error so the tenacity retry decorator can catch it
+            raise audio_err 
             
         # Create a new temporary WAV file
         temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
@@ -208,23 +211,27 @@ def download_audio(url):
         # Write the processed audio to the final temporary WAV file
         audio.export(temp_wav_path, format="wav")
         
-        # Clean up the original downloaded MP3 file immediately
-        if temp_mp3_path and os.path.exists(temp_mp3_path):
-            os.unlink(temp_mp3_path)
-            
         return temp_wav_path, None
+    
     except requests.exceptions.RequestException as e:
-        if temp_mp3_path and os.path.exists(temp_mp3_path): os.unlink(temp_mp3_path)
-        if temp_wav_path and os.path.exists(temp_wav_path): os.unlink(temp_wav_path)
-        return None, f"Failed to download audio: {str(e)}"
-    except IOError as e:
-        if temp_mp3_path and os.path.exists(temp_mp3_path): os.unlink(temp_mp3_path)
-        if temp_wav_path and os.path.exists(temp_wav_path): os.unlink(temp_wav_path)
-        return None, f"Failed to write audio file: {str(e)}"
+        # This catches network errors, 4xx/5xx responses, and the custom "corrupted download" error
+        error_msg = f"Failed to download audio: {str(e)}"
+        return None, error_msg
+        
     except Exception as e:
-        if temp_mp3_path and os.path.exists(temp_mp3_path): os.unlink(temp_mp3_path)
-        if temp_wav_path and os.path.exists(temp_wav_path): os.unlink(temp_wav_path)
-        return None, f"Unexpected error downloading/converting audio: {str(e)}"
+        # This catches Pydub errors (Header Missing) and general unexpected exceptions
+        error_msg = f"Unexpected error during download/conversion: {str(e)}"
+        return None, error_msg
+        
+    finally:
+        # Always clean up temporary files created in this function
+        if temp_mp3_path and os.path.exists(temp_mp3_path):
+             try:
+                 os.unlink(temp_mp3_path)
+             except Exception as cleanup_err:
+                 logger.warning(f"Failed cleanup MP3 {temp_mp3_path}: {cleanup_err}")
+        # Note: temp_wav_path is cleaned up in process_call_recording
+        
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def transcribe_audio(file_path):
@@ -276,6 +283,7 @@ def extract_features_scipy(sr, y):
 
     # Ensure y is float data for calculations (if it was loaded as int)
     if y.dtype.kind in np.dtype(np.int16).kind:
+        # Scale to [-1.0, 1.0]
         y = y.astype(np.float64) / np.iinfo(y.dtype).max
     else:
         y = y.astype(np.float64)
@@ -323,8 +331,6 @@ def split_audio_channels_scipy(audio_path):
         # Mono file, cannot split
         return audio_path, audio_path, sr
         
-    # Ensure y is a numpy array (scipy.io.wavfile.read already returns numpy array)
-    
     # Stereo file: y[:, 0] is typically left (Agent), y[:, 1] is right (Customer)
     agent_data = y[:, 0]
     cust_data = y[:, 1]
@@ -348,7 +354,7 @@ def extract_features_from_path(audio_path):
         sr, y = wavfile.read(audio_path)
         # Ensure 'y' is a numpy array of data points
         if y.ndim > 1:
-            # Handle the case where the split function failed to convert to mono
+            # If multi-channel somehow made it here, take first channel
             y = y[:, 0] 
         return extract_features_scipy(sr, y)
     except Exception as e:
@@ -920,7 +926,7 @@ def store_call_analysis(agent_data, call_data, analysis, tone_analysis, storage_
         return None
         
 def update_agent_stats(agent_id, call_data, call_doc_name):
-    """Update agent's daily, weekly, monthly, and overall performance statistics."""
+    """Update agent's daily, weekly, monthly, and overall performance statistics. Note: This uses UTC for agent stats as it's typically fine for agent performance tracking."""
     if not db:
         return
     
@@ -934,7 +940,7 @@ def update_agent_stats(agent_id, call_data, call_doc_name):
         agent_data = agent.to_dict()
         agent_name = agent_data.get('name', 'Unknown')
         
-        # Current date for daily tracking
+        # Current date for daily tracking (using server's default time, typically UTC)
         current_time = datetime.now()
         current_date = current_time.strftime("%Y-%m-%d")
         current_week = current_time.strftime("%Y-%U")
@@ -1172,20 +1178,24 @@ def process_call_recording(recording_url, call_data, call_type):
 
 def update_call_volume_stats(call_data, call_type="answered"):
     """
-    Update INCOMING call volume statistics. This is only for INCOMING calls.
-    C2C calls are tracked separately by update_c2c_stats.
+    Update INCOMING call volume statistics using IST for all time keys and checks.
     """
     if not db:
         return
     
     try:
-        current_time = datetime.now()
-        current_date = current_time.strftime("%Y-%m-%d")
-        current_week = current_time.strftime("%Y-%U")
-        current_month = current_time.strftime("%Y-%m")
-        current_hour = current_time.strftime("%H:00")
+        # --- 1. Get Localized IST Time ---
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        # Ensure 'current_time' is timezone-aware IST
+        current_time = datetime.now(ist_tz) 
         
-        # Determine if this is an off-hours call (before 10am or after 7pm)
+        # --- 2. Generate Time Keys using IST ---
+        current_date = current_time.strftime("%Y-%m-%d") # IST date
+        current_week = current_time.strftime("%Y-%U")    # IST week
+        current_month = current_time.strftime("%Y-%m")  # IST month
+        current_hour = current_time.strftime("%H:00")   # IST hour
+        
+        # Determine if this is an off-hours call (10am to 7pm IST is ON-hours)
         hour = current_time.hour
         is_off_hours = hour < 10 or hour >= 19
         
@@ -1200,7 +1210,7 @@ def update_call_volume_stats(call_data, call_type="answered"):
             volume_data = {
                 'totalCallsReceived': 0,
                 'totalCallsAnswered': 0,
-                'totalOffHoursCalls': 0, 
+                'totalOffHoursCalls': 0,  
                 'dailyStats': {},
                 'weeklyStats': {},
                 'monthlyStats': {},
@@ -1214,7 +1224,8 @@ def update_call_volume_stats(call_data, call_type="answered"):
                     'weekly': {},
                     'monthly': {}
                 },
-                'lastUpdated': datetime.now()
+                # Use non-aware UTC for Firestore timestamp type
+                'lastUpdated': datetime.now() 
             }
         
         # Update overall stats
@@ -1223,7 +1234,7 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             volume_data['totalCallsAnswered'] += 1
             
-            # NEW: Update off-hours calls count for answered calls only
+            # Update off-hours calls count
             if is_off_hours:
                 volume_data['totalOffHoursCalls'] += 1
                 
@@ -1233,13 +1244,13 @@ def update_call_volume_stats(call_data, call_type="answered"):
                 else:  # hour >= 19
                     volume_data['offHoursDistribution']['evening_night'] = volume_data['offHoursDistribution'].get('evening_night', 0) + 1
         
-        # Update daily stats
+        # --- Update dailyStats (using IST date key) ---
         if current_date not in volume_data['dailyStats']:
             volume_data['dailyStats'][current_date] = {
                 'callsReceived': 0,
                 'callsAnswered': 0,
                 'offHoursCalls': 0,  
-                'hourlyBreakdown': {}
+                'hourlyBreakdown': {} # Uses IST hour key
             }
         
         daily_stats = volume_data['dailyStats'][current_date]
@@ -1248,11 +1259,10 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             daily_stats['callsAnswered'] += 1
             
-            # NEW: Update daily off-hours calls
             if is_off_hours:
                 daily_stats['offHoursCalls'] += 1
         
-        # Update hourly breakdown for the day
+        # Update hourly breakdown for the day (using IST hour key)
         if current_hour not in daily_stats['hourlyBreakdown']:
             daily_stats['hourlyBreakdown'][current_hour] = {
                 'received': 0,
@@ -1264,17 +1274,16 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             daily_stats['hourlyBreakdown'][current_hour]['answered'] += 1
             
-            # NEW: Update hourly off-hours
             if is_off_hours:
                 daily_stats['hourlyBreakdown'][current_hour]['offHours'] += 1
         
-        # Update weekly stats
+        # --- Update weeklyStats (using IST week key) ---
         if current_week not in volume_data['weeklyStats']:
             volume_data['weeklyStats'][current_week] = {
                 'callsReceived': 0,
                 'callsAnswered': 0,
                 'offHoursCalls': 0,  
-                'dailyBreakdown': {}
+                'dailyBreakdown': {} # Uses IST date key
             }
         
         weekly_stats = volume_data['weeklyStats'][current_week]
@@ -1283,33 +1292,31 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             weekly_stats['callsAnswered'] += 1
             
-            # NEW: Update weekly off-hours calls
             if is_off_hours:
                 weekly_stats['offHoursCalls'] += 1
         
-        # Update daily breakdown for the week
+        # Update daily breakdown for the week (using IST date key)
         if current_date not in weekly_stats['dailyBreakdown']:
             weekly_stats['dailyBreakdown'][current_date] = {
                 'received': 0,
                 'answered': 0,
-                'offHours': 0  
+                'offHours': 0 
             }
         
         weekly_stats['dailyBreakdown'][current_date]['received'] += 1
         if call_type == "answered":
             weekly_stats['dailyBreakdown'][current_date]['answered'] += 1
             
-            # NEW: Update daily off-hours in weekly breakdown
             if is_off_hours:
                 weekly_stats['dailyBreakdown'][current_date]['offHours'] += 1
         
-        # Update monthly stats
+        # --- Update monthlyStats (using IST month key) ---
         if current_month not in volume_data['monthlyStats']:
             volume_data['monthlyStats'][current_month] = {
                 'callsReceived': 0,
                 'callsAnswered': 0,
                 'offHoursCalls': 0,  
-                'weeklyBreakdown': {}
+                'weeklyBreakdown': {} # Uses IST week key
             }
         
         monthly_stats = volume_data['monthlyStats'][current_month]
@@ -1318,11 +1325,10 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             monthly_stats['callsAnswered'] += 1
             
-            # NEW: Update monthly off-hours calls
             if is_off_hours:
                 monthly_stats['offHoursCalls'] += 1
         
-        # Update weekly breakdown for the month
+        # Update weekly breakdown for the month (using IST week key)
         if current_week not in monthly_stats['weeklyBreakdown']:
             monthly_stats['weeklyBreakdown'][current_week] = {
                 'received': 0,
@@ -1334,11 +1340,10 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             monthly_stats['weeklyBreakdown'][current_week]['answered'] += 1
             
-            # NEW: Update weekly off-hours in monthly breakdown
             if is_off_hours:
                 monthly_stats['weeklyBreakdown'][current_week]['offHours'] += 1
         
-        # Update hourly distribution (across all time)
+        # --- Update hourlyDistribution (using IST hour key) ---
         if current_hour not in volume_data['hourlyDistribution']:
             volume_data['hourlyDistribution'][current_hour] = {
                 'received': 0,
@@ -1350,20 +1355,19 @@ def update_call_volume_stats(call_data, call_type="answered"):
         if call_type == "answered":
             volume_data['hourlyDistribution'][current_hour]['answered'] += 1
             
-            # NEW: Update off-hours in hourly distribution
             if is_off_hours:
                 volume_data['hourlyDistribution'][current_hour]['offHours'] += 1
         
-        # Update peak hours (this will be calculated on-demand when requested)
+        # Update peak hours (signals recalculation)
         volume_data['peakHours']['needsRecalculation'] = True
         
-        # Update last updated timestamp
+        # Update last updated timestamp (use non-aware UTC for Firestore timestamp type)
         volume_data['lastUpdated'] = datetime.now()
         
         # Save back to Firestore
         volume_ref.set(volume_data)
         
-        logger.info(f"Updated call volume stats for {call_type} call - Off-hours: {is_off_hours}")
+        logger.info(f"Updated call volume stats for {call_type} call - Off-hours: {is_off_hours} (IST Hour: {hour})")
         
     except Exception as e:
         logger.error(f"Failed to update call volume stats: {str(e)}")
@@ -1481,7 +1485,7 @@ def calculate_volume_trend(data_points):
     
     # Simple trend calculation
     if len(calls) >= 2:
-        # Avoid zero division
+        # Calculate averages for comparison
         if len(calls) > 2:
             recent_avg = statistics.mean(calls[-2:])
             previous_avg = statistics.mean(calls[:-2])
@@ -1559,7 +1563,7 @@ def generate_peak_recommendations(peak_hours):
             )[:3]
             
             if busiest_hours:
-                rec_text = "Ensure adequate staffing during peak hours: "
+                rec_text = "Ensure adequate staffing during peak hours (IST): "
                 rec_text += ", ".join([f"{hour} ({calls} calls)" for hour, calls in busiest_hours])
                 recommendations.append(rec_text)
     
