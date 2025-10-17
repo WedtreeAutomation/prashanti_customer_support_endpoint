@@ -242,18 +242,23 @@ def detect_language(transcription):
 def extract_features(audio_path):
     """
     Extract acoustic features (pitch, energy, tempo, ZCR) from the audio.
-    Optimized by downsampling to PERFORMANCE_SR (8000 Hz).
+    Optimized for low memory usage using soundfile instead of librosa.load.
     """
+    import soundfile as sf
+    import numpy as np
+    import librosa
+
     try:
-        # Load audio data. Downsampling significantly reduces computation time,
-        # mitigating the worker timeout error.
-        y, sr = librosa.load(audio_path, sr=PERFORMANCE_SR, mono=True, res_type='kaiser_fast')
+        # Load audio safely without Numba overhead
+        y, sr = sf.read(audio_path)
+        if y.ndim > 1:
+            y = y.mean(axis=1)  # convert stereo → mono
     except Exception as e:
-        logger.error(f"librosa load error for {audio_path}: {e}")
+        logger.error(f"Audio load error for {audio_path}: {e}")
         return None
 
     # Pitch: Use typical voice range limits to filter noise
-    pitches, _ = librosa.piptrack(y=y, sr=sr, fmin=75, fmax=400) 
+    pitches, _ = librosa.piptrack(y=y, sr=sr, fmin=75, fmax=400)
     pitch_values = pitches[pitches > 0]
     avg_pitch = np.mean(pitch_values) if len(pitch_values) > 0 else 0.0
     pitch_std = np.std(pitch_values) if len(pitch_values) > 0 else 0.0
@@ -263,13 +268,13 @@ def extract_features(audio_path):
     avg_energy = np.mean(rms)
     energy_std = np.std(rms)
 
-    # Tempo (Speech Rate Proxy): Adjusted hop_length for faster tracking on downsampled audio
+    # Tempo (Speech Rate Proxy)
     try:
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, start_bpm=120, hop_length=256)  
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, start_bpm=120, hop_length=256)
         tempo_value = float(tempo[0]) if hasattr(tempo, "__len__") else float(tempo)
     except Exception:
         tempo_value = 0.0
-        
+
     # Zero Crossing Rate
     zcr = librosa.feature.zero_crossing_rate(y)
     avg_zcr = np.mean(zcr)
@@ -286,30 +291,32 @@ def extract_features(audio_path):
 
 def split_audio_channels(audio_path):
     """Split stereo audio into two mono temporary files (agent and customer)."""
-    try:
-        # Load as stereo (mono=False) and downsample consistently
-        y, sr = librosa.load(audio_path, sr=PERFORMANCE_SR, mono=False, res_type='kaiser_fast')
-    except Exception as e:
-        logger.error(f"librosa load error for splitting {audio_path}: {e}")
-        return audio_path, audio_path, None # Treat as mono if load fails
 
-    if y.ndim == 1:
+    try:
+        # Load audio safely (no Numba or resampling)
+        y, sr = sf.read(audio_path, always_2d=True)
+    except Exception as e:
+        logger.error(f"Audio load error for splitting {audio_path}: {e}")
+        return audio_path, audio_path, None  # Treat as mono if load fails
+
+    if y.shape[1] == 1:
         # Mono file, cannot split
         return audio_path, audio_path, sr
 
-    # Stereo file: y[0] is typically left (Agent), y[1] is right (Customer)
-    agent_temp = tempfile.NamedTemporaryFile(delete=False, suffix='_agent.wav')
-    cust_temp = tempfile.NamedTemporaryFile(delete=False, suffix='_cust.wav')
+    # Stereo file: first channel = agent, second = customer
+    agent_temp = tempfile.NamedTemporaryFile(delete=False, suffix="_agent.wav")
+    cust_temp = tempfile.NamedTemporaryFile(delete=False, suffix="_cust.wav")
     agent_temp.close()
     cust_temp.close()
 
-    # Write each channel to a separate temporary WAV file
-    sf.write(agent_temp.name, y[0], sr)
-    sf.write(cust_temp.name, y[1], sr)
-    
+    # Write each channel to separate temporary WAV files
+    sf.write(agent_temp.name, y[:, 0], sr)
+    sf.write(cust_temp.name, y[:, 1], sr)
+
     logger.info(f"Split stereo audio into {agent_temp.name} and {cust_temp.name}")
 
     return agent_temp.name, cust_temp.name, sr
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def analyze_tone_with_azure(agent_features, customer_features):
