@@ -10,7 +10,5 @@ google-cloud-storage
 google-auth 
 google-api-python-client 
 gunicorn
-librosa
-pydub
-scipy
 pytz
+soundfile
