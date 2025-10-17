@@ -1821,8 +1821,25 @@ def get_peak_hours():
         logger.error(f"Error fetching peak hours: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route("/", methods=["GET"])
+def root():
+    """Root endpoint with service information"""
+    return jsonify({
+        "service": "Prashanti Customer Support Call Analysis API",
+        "status": "running", 
+        "timestamp": get_now_ist().isoformat(),
+        "endpoints": {
+            "health": "/health",
+            "webhook": "/webhook (POST)",
+            "agent_stats": "/agent/<email> (GET)",
+            "volume_stats": "/stats/volume (GET)", 
+            "peak_hours": "/stats/peak-hours (GET)"
+        },
+        "version": "1.0"
+    }), 200
+
 # -------------------------------------------------
-# Main Runner
+# Main Runner  
 # -------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
