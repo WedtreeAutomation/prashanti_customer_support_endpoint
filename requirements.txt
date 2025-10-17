@@ -11,3 +11,5 @@ google-auth
 google-api-python-client 
 gunicorn
 librosa
+pydub
+scipy
