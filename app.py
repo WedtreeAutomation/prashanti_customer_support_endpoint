@@ -1183,7 +1183,7 @@ def process_call_recording(recording_url, call_data, call_type):
                     os.unlink(f)
                 except Exception as e:
                     logger.error(f"Failed to delete temp file {f}: {str(e)}")
-
+                    
 def update_call_volume_stats(call_data, call_type="answered"):
     if not db:
         return
@@ -1230,18 +1230,18 @@ def update_call_volume_stats(call_data, call_type="answered"):
         # Update overall stats
         volume_data['totalCallsReceived'] += 1
         
+        # FIX: Update off-hours calls count for ALL calls (answered + unanswered)
+        if is_off_hours:
+            volume_data['totalOffHoursCalls'] += 1
+            
+            # Update off-hours distribution for ALL off-hours calls
+            if hour < 10:
+                volume_data['offHoursDistribution']['early_morning'] += 1
+            else:  # hour >= 19
+                volume_data['offHoursDistribution']['evening_night'] += 1
+        
         if call_type == "answered":
             volume_data['totalCallsAnswered'] += 1
-            
-            # NEW: Update off-hours calls count for answered calls only
-            if is_off_hours:
-                volume_data['totalOffHoursCalls'] += 1
-                
-                # Update off-hours distribution
-                if hour < 10:
-                    volume_data['offHoursDistribution']['early_morning'] += 1
-                else:  # hour >= 19
-                    volume_data['offHoursDistribution']['evening_night'] += 1
         
         # Update daily stats (unchanged logic, but using IST strings)
         if current_date not in volume_data['dailyStats']:
@@ -1255,12 +1255,12 @@ def update_call_volume_stats(call_data, call_type="answered"):
         daily_stats = volume_data['dailyStats'][current_date]
         daily_stats['callsReceived'] += 1
         
+        # FIX: Update daily off-hours calls for ALL calls
+        if is_off_hours:
+            daily_stats['offHoursCalls'] += 1
+        
         if call_type == "answered":
             daily_stats['callsAnswered'] += 1
-            
-            # NEW: Update daily off-hours calls
-            if is_off_hours:
-                daily_stats['offHoursCalls'] += 1
         
         # Update hourly breakdown for the day
         if current_hour not in daily_stats['hourlyBreakdown']:
@@ -1271,12 +1271,13 @@ def update_call_volume_stats(call_data, call_type="answered"):
             }
         
         daily_stats['hourlyBreakdown'][current_hour]['received'] += 1
+        
+        # FIX: Update hourly off-hours for ALL calls
+        if is_off_hours:
+            daily_stats['hourlyBreakdown'][current_hour]['offHours'] += 1
+        
         if call_type == "answered":
             daily_stats['hourlyBreakdown'][current_hour]['answered'] += 1
-            
-            # NEW: Update hourly off-hours
-            if is_off_hours:
-                daily_stats['hourlyBreakdown'][current_hour]['offHours'] += 1
         
         # Update weekly stats (unchanged logic, but using IST strings)
         if current_week not in volume_data['weeklyStats']:
@@ -1290,12 +1291,12 @@ def update_call_volume_stats(call_data, call_type="answered"):
         weekly_stats = volume_data['weeklyStats'][current_week]
         weekly_stats['callsReceived'] += 1
         
+        # FIX: Update weekly off-hours calls for ALL calls
+        if is_off_hours:
+            weekly_stats['offHoursCalls'] += 1
+        
         if call_type == "answered":
             weekly_stats['callsAnswered'] += 1
-            
-            # NEW: Update weekly off-hours calls
-            if is_off_hours:
-                weekly_stats['offHoursCalls'] += 1
         
         # Update daily breakdown for the week
         if current_date not in weekly_stats['dailyBreakdown']:
@@ -1306,12 +1307,13 @@ def update_call_volume_stats(call_data, call_type="answered"):
             }
         
         weekly_stats['dailyBreakdown'][current_date]['received'] += 1
+        
+        # FIX: Update daily off-hours in weekly breakdown for ALL calls
+        if is_off_hours:
+            weekly_stats['dailyBreakdown'][current_date]['offHours'] += 1
+        
         if call_type == "answered":
             weekly_stats['dailyBreakdown'][current_date]['answered'] += 1
-            
-            # NEW: Update daily off-hours in weekly breakdown
-            if is_off_hours:
-                weekly_stats['dailyBreakdown'][current_date]['offHours'] += 1
         
         # Update monthly stats (unchanged logic, but using IST strings)
         if current_month not in volume_data['monthlyStats']:
@@ -1325,12 +1327,12 @@ def update_call_volume_stats(call_data, call_type="answered"):
         monthly_stats = volume_data['monthlyStats'][current_month]
         monthly_stats['callsReceived'] += 1
         
+        # FIX: Update monthly off-hours calls for ALL calls
+        if is_off_hours:
+            monthly_stats['offHoursCalls'] += 1
+        
         if call_type == "answered":
             monthly_stats['callsAnswered'] += 1
-            
-            # NEW: Update monthly off-hours calls
-            if is_off_hours:
-                monthly_stats['offHoursCalls'] += 1
         
         # Update weekly breakdown for the month
         if current_week not in monthly_stats['weeklyBreakdown']:
@@ -1341,12 +1343,13 @@ def update_call_volume_stats(call_data, call_type="answered"):
             }
         
         monthly_stats['weeklyBreakdown'][current_week]['received'] += 1
+        
+        # FIX: Update weekly off-hours in monthly breakdown for ALL calls
+        if is_off_hours:
+            monthly_stats['weeklyBreakdown'][current_week]['offHours'] += 1
+        
         if call_type == "answered":
             monthly_stats['weeklyBreakdown'][current_week]['answered'] += 1
-            
-            # NEW: Update weekly off-hours in monthly breakdown
-            if is_off_hours:
-                monthly_stats['weeklyBreakdown'][current_week]['offHours'] += 1
         
         # Update hourly distribution (across all time)
         if current_hour not in volume_data['hourlyDistribution']:
@@ -1357,12 +1360,13 @@ def update_call_volume_stats(call_data, call_type="answered"):
             }
         
         volume_data['hourlyDistribution'][current_hour]['received'] += 1
+        
+        # FIX: Update off-hours in hourly distribution for ALL calls
+        if is_off_hours:
+            volume_data['hourlyDistribution'][current_hour]['offHours'] += 1
+        
         if call_type == "answered":
             volume_data['hourlyDistribution'][current_hour]['answered'] += 1
-            
-            # NEW: Update off-hours in hourly distribution
-            if is_off_hours:
-                volume_data['hourlyDistribution'][current_hour]['offHours'] += 1
         
         # Update peak hours (this will be calculated on-demand when requested)
         # For now, we'll just mark that we need to recalculate
@@ -1378,7 +1382,6 @@ def update_call_volume_stats(call_data, call_type="answered"):
         
     except Exception as e:
         logger.error(f"Failed to update call volume stats: {str(e)}")
-
 
 def calculate_peak_hours(volume_data):
     try:
